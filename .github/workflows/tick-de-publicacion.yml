@@ -1,0 +1,183 @@
+# =============================================================================
+# EL RELOJ DEL TICK DE PUBLICACIÓN — Plan 08-07.
+#
+# ⚠️⚠️ ESTE ARCHIVO **NO VIVE EN `.github/workflows/` DE ESTE REPOSITORIO**, Y NO
+#      ES UN DESCUIDO: ES LA DECISIÓN DEL USUARIO DEL CHECKPOINT DEL 08-01.
+#
+#   «Repo público dedicado, cada 5 min.» — del usuario, transcrito verbatim en
+#   `08-01-SUMMARY.md`.
+#
+# El repo del panel es **privado y de la organización**, así que un workflow acá
+# adentro gastaría la **cuota de minutos de Actions de la organización** — que es
+# exactamente el costo que la opción elegida evita: **los repos públicos no la
+# consumen**. Y el reloj lleva **sólo esto**: un YAML que golpea un webhook con
+# un secreto, **ni una línea del código del panel**.
+#
+# Por eso vive en `.github/relojes/`, que GitHub **no ejecuta**: es el contenido
+# del repo dedicado, versionado al lado del endpoint que golpea para que los dos
+# se lean juntos. Para ponerlo a andar, ver `.github/relojes/README.md`.
+#
+# -----------------------------------------------------------------------------
+# LAS CUATRO COSAS QUE HAY QUE SABER ANTES DE TOCAR ESTE ARCHIVO
+# -----------------------------------------------------------------------------
+#
+# 1. ⚠️ **ESTE WORKFLOW NO DESPLIEGA NADA.** El despliegue del panel es **a mano**
+#    (`vercel --prod --yes`) porque el plan Hobby no enlaza el repo privado de la
+#    organización: **empujar a GitHub no despliega**. Si alguien cambia el
+#    endpoint y no despliega, este reloj sigue golpeando el código viejo sin que
+#    nada avise.
+#
+# 2. ⚠️ **EL PERÍODO DE ACÁ ABAJO ESTÁ ATADO A `PERIODO_DEL_TICK_MS`**
+#    (`src/domain/ventana-de-la-programacion.ts`), del que se **deriva** la
+#    ventana de tolerancia. Un reloj cada 30 minutos contra una ventana derivada
+#    de 5 convierte el sistema en un **generador de vencidas**: las órdenes salen
+#    de la ventana antes de que el tick las alcance y se vencen solas.
+#    **Los dos números se comparan como criterio** en el bloque 5 de
+#    `scripts/diff-en-cero-fase8.sh`; si cambiás uno, cambiá el otro y corré
+#    `npm run check:diff-en-cero-8`.
+#
+# 3. **EL TICK ADEMÁS DESPIERTA LA BASE.** El proyecto de Supabase está en el plan
+#    gratuito y **se pausa tras 7 días sin actividad** —ya le pasó dos veces a
+#    este despliegue—. El endpoint consulta la tabla **incluso cuando no hay nada
+#    que publicar**, y eso está medido
+#    (`tests/brand/avisos-de-la-programacion.test.ts`, caso 3). O sea: apagar este
+#    reloj no sólo deja de publicar, también deja dormir a la base.
+#
+# 4. **SI EMPIEZA A FALLAR**, el código de estado que el paso imprime dice cuál de
+#    los tres problemas es:
+#      · **401** → el secreto no coincide. Están en dos lados y tienen que ser el
+#        MISMO: la variable `CRON_SECRET` de Vercel (Production) y el secreto
+#        `CRON_SECRET` de este repo. ⚠️ Un `CRON_SECRET` **ausente** en Vercel
+#        también da 401: la ruta falla CERRADA a propósito.
+#      · **404** → la URL está mal o el panel no se desplegó nunca.
+#      · **405** → alguien cambió el método. La ruta exporta **sólo `POST`**, y no
+#        es purismo REST: un endpoint con efecto que contesta a un `GET` lo
+#        dispara cualquier bot de previsualización de mensajería con sólo pegar el
+#        link en un chat.
+#      · **500** → el tick corrió y reventó. El `--fail-with-body` imprime el
+#        cuerpo, que **no nombra piezas ni marcas** (es un endpoint público).
+# =============================================================================
+
+name: tick-de-publicacion
+
+on:
+  schedule:
+    # ⚠️ CADA 5 MINUTOS, Y ES EL MISMO NÚMERO QUE `PERIODO_DEL_TICK_MS`. Ver el
+    # punto 2 del encabezado. 5 es además el MÍNIMO que GitHub acepta.
+    #
+    # ⚠️ Y LO QUE GITHUB NO PROMETE, ESCRITO ACÁ PORQUE LA VENTANA LO ASUME: las
+    # corridas por `schedule` **pueden atrasarse** y **pueden descartarse** si la
+    # cola está cargada. Por eso la ventana de tolerancia es **más grande que un
+    # período** y no igual: está derivada con ticks que pueden faltar adentro.
+    - cron: "*/5 * * * *"
+  # Para poder dispararlo a mano y leer su log sin esperar al próximo período.
+  workflow_dispatch:
+
+# ⚠️⚠️ CERO PERMISOS SOBRE EL REPO, Y ES GRATIS.
+#
+# Este job no usa `GITHUB_TOKEN` para nada: **no hay `checkout`**, no le pregunta
+# nada a la API de GitHub y no escribe una línea en el repo — su único efecto es un
+# POST a un host de afuera. Sin esta línea vale el **default del repositorio o de la
+# organización**, que lo fija GitHub y puede ser permisivo; con `{}` el token del job
+# nace sin un solo permiso.
+#
+# ⚠️ Y en un repo **público** el alcance de ese default importa más, no menos: el
+# log, el YAML y el nombre del repo son visibles para cualquiera (decisión del
+# usuario, 08-01), así que lo único que no se puede mirar desde afuera es lo que el
+# token puede hacer. Que no pueda hacer nada es la respuesta más corta.
+permissions: {}
+
+# ⚠️⚠️ `cancel-in-progress: false`, Y LA PROPIEDAD QUE DEFIENDE ES LA CORRECTA
+# AUNQUE EL MECANISMO QUE ACÁ SE DESCRIBÍA NO SEA EL QUE GITHUB DOCUMENTA.
+#
+# ⚠️ **ESTE BLOQUE DECÍA «lo que se descarta es el tick NUEVO, nunca el viejo» Y
+# ESO NO ES LO QUE GITHUB DOCUMENTA.** Se deja dicho que era falso en vez de
+# reescribirlo en silencio, que es la misma forma que el encabezado de
+# `src/app/cron/publicar/route.ts` usó con su premisa del proxy: un comentario y su
+# contraparte diciendo cosas opuestas es peor que cualquiera de las dos.
+#
+# **Lo que la documentación de GitHub describe para `concurrency` con
+# `cancel-in-progress: false`:**
+#
+#   · la corrida **EN VUELO no se cancela nunca** — eso es exactamente lo que compra
+#     el `false`, y es la mitad que importa;
+#   · una corrida nueva del mismo grupo **NO se descarta: queda PENDIENTE**,
+#     esperando a que la que está en vuelo termine;
+#   · lo que **sí** se cancela es una corrida que ya estaba **pendiente** en el
+#     grupo, desplazada por la más nueva.
+#
+# ⚠️⚠️ **ESTO ES COMPORTAMIENTO DOCUMENTADO, NO MEDIDO.** Esta ola no tiene forma de
+# ejercer el runtime de GitHub desde el árbol del panel —el repo del reloj todavía no
+# existe—, así que va declarado como lo que es: lo que la documentación dice, no lo
+# que alguien vio pasar. El día que el reloj exista, dos corridas solapadas leídas en
+# el log lo convierten en medido; hasta entonces, no.
+#
+# ⚠️ **LA PROPIEDAD SOBREVIVE A LA CORRECCIÓN, Y POR ESO LA LÍNEA NO CAMBIA:** lo
+# que no se puede hacer es cancelar un tick **en el medio de una publicación**, que
+# deja una llamada HTTP en vuelo sin nadie que resuelva su desenlace — exactamente el
+# estado `sin-resolver` que D-137 existe para no fabricar, y que nadie reintenta solo
+# porque el mensaje **pudo haber salido**. `false` es lo que garantiza eso.
+#
+# ⚠️ Lo que la corrección sí cambia es una expectativa operativa: con el `false`
+# puede haber un tick **esperando**, así que un tick lento **corre** al siguiente en
+# vez de hacerlo desaparecer. Con `timeout-minutes: 3` contra un período de 5 el
+# solapamiento pide que una corrida pase su propio timeout —o que el `schedule`
+# llegue atrasado, que GitHub documenta que puede pasar (ver el `cron` de arriba)—,
+# así que la cola de este grupo casi siempre está vacía. **Casi siempre no es
+# siempre, y por eso el `false` no es decorativo.**
+concurrency:
+  group: tick-de-publicacion
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    # Corto a propósito: un tick colgado que se superpone con el siguiente es la
+    # segunda forma de que dos disparos se solapen. El índice único parcial la
+    # cubre, pero no hay razón para invitarla.
+    timeout-minutes: 3
+
+    steps:
+      # ⚠️ NO HAY `actions/checkout`: este repo no tiene código y el paso no lo
+      # necesita. Un checkout de más es superficie de más en un repo público.
+      - name: Golpear el endpoint del tick
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          # ⚠️ `--fail-with-body` NO ES ADORNO: un `curl` SIN `--fail` devuelve 0
+          # contra un 500, y el workflow queda VERDE sobre un tick que no hizo
+          # nada. Es el silencio que esta ola existe para evitar, trasladado una
+          # capa. Con `--fail-with-body` el cuerpo del error igual se imprime.
+          #
+          # ⚠️ SIN `-v` Y SIN ECO DEL SECRETO. GitHub enmascara los `secrets` en
+          # los logs, pero un log de un repo PÚBLICO no es lugar para apoyarse en
+          # eso. La credencial viaja por `--header` desde la variable de entorno y
+          # no aparece en ninguna línea impresa.
+          #
+          # ⚠️ EL FUSIBLE DEL SECRETO AUSENTE, Y VA PRIMERO. Sin esta guarda, un
+          # repo recién creado manda un `Bearer ` vacío, come un 401 y el log dice
+          # «no autorizado» — que manda a revisar el secreto de Vercel cuando el
+          # que falta es el de acá.
+          if [ -z "${CRON_SECRET}" ]; then
+            echo "FALTA el secreto CRON_SECRET en este repositorio."
+            echo "Settings -> Secrets and variables -> Actions -> New repository secret."
+            exit 1
+          fi
+
+          CODIGO="$(curl --silent --show-error --fail-with-body \
+            --max-time 120 \
+            --write-out '%{http_code}' \
+            --output /tmp/respuesta-del-tick.json \
+            --request POST \
+            --header "authorization: Bearer ${CRON_SECRET}" \
+            'https://content-crm-five.vercel.app/cron/publicar')" || true
+
+          # ⚠️ EL CÓDIGO SE AFIRMA, NO SE MIRA. Imprimirlo y seguir sería el mismo
+          # verde que `--fail` evita, con un número arriba para despistar.
+          echo "codigo=${CODIGO}"
+          echo "cuerpo=$(cat /tmp/respuesta-del-tick.json 2>/dev/null)"
+
+          if [ "${CODIGO}" != "200" ]; then
+            echo "El tick NO contesto 200. Ver el punto 4 del encabezado del workflow."
+            exit 1
+          fi
